@@ -5,12 +5,21 @@ on:
     - cron: '*/15 * * * *' # setiap 15 menit (UTC)
   workflow_dispatch: {}
 
+concurrency:
+  group: notify-cron
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
   send-scheduled:
     runs-on: ubuntu-latest
+    env:
+      DRY_RUN: ${{ vars.DRY_RUN }}
+      BATCH_LIMIT: ${{ vars.BATCH_LIMIT }}
+      MAX_BATCHES: ${{ vars.MAX_BATCHES }}
+      MAX_ATTEMPTS: ${{ vars.MAX_ATTEMPTS }}
     steps:
       - name: Checkout repository (optional)
         uses: actions/checkout@v4
@@ -43,5 +52,9 @@ jobs:
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
           FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          DRY_RUN: ${{ env.DRY_RUN }}
+          BATCH_LIMIT: ${{ env.BATCH_LIMIT }}
+          MAX_BATCHES: ${{ env.MAX_BATCHES }}
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
         run: |
           node dist/sendScheduled.js || npx ts-node --transpile-only src/sendScheduled.ts
