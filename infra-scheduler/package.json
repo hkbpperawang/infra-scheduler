@@ -1,0 +1,21 @@
+{
+  "name": "infra-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scheduler mandiri untuk memproses scheduled_notifications Firestore dan mengirim FCM HTTP v1 via firebase-admin.",
+  "main": "dist/sendScheduled.js",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/sendScheduled.js",
+    "send:once": "ts-node --transpile-only src/sendScheduled.ts"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  },
+  "devDependencies": {
+  "@types/node": "^20.11.30",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  }
+}
