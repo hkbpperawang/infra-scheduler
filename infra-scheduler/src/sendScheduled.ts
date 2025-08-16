@@ -1,8 +1,19 @@
 /*
+  Scheduler mandiri untuk Spark Plan (tanpa Cloud Functions/Cloud Scheduler).
   - Membaca Firestore collection `scheduled_notifications` yang due.
   - Mengirim FCM HTTP v1 via firebase-admin (service account).
   - Mencatat hasil ke koleksi `notifications` dan update status agar idempoten.
+
+  Lingkungan:
+  - GOOGLE_APPLICATION_CREDENTIALS: path file service account JSON (opsional, atau gunakan pemuatan via secret JSON inline).
+  - FIREBASE_PROJECT_ID: project id Firebase.
+
+  Secrets di GitHub Actions dianjurkan:
+  - GCP_SA_JSON: isi JSON service account.
+  - FIREBASE_PROJECT_ID: project id.
 */
+/* eslint-disable @typescript-eslint/triple-slash-reference */
+/// <reference types="node" />
 
 import { initializeApp, applicationDefault, cert, AppOptions } from 'firebase-admin/app';
 import { getFirestore, Timestamp, Firestore, Transaction, DocumentData } from 'firebase-admin/firestore';
@@ -62,6 +73,7 @@ async function main(): Promise<void> {
   const DRY_RUN = /^1|true$/i.test(String(process.env.DRY_RUN || ''));
   const BATCH_LIMIT = parseInt(process.env.BATCH_LIMIT ?? '50', 10);
   const MAX_BATCHES = parseInt(process.env.MAX_BATCHES ?? '10', 10);
+  const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS ?? '5', 10);
 
   let processed = 0;
   for (let batch = 0; batch < MAX_BATCHES; batch++) {
@@ -169,13 +181,21 @@ async function main(): Promise<void> {
     } catch (err) {
         const msg = (err as Error).message ?? String(err);
         console.error(`Gagal kirim ${doc.id}:`, msg);
-        if (isRetryableError(err)) {
-          // Naikkan attemptCount dan kembalikan ke queued untuk dicoba lagi pada run berikutnya
-          await doc.ref.update({ status: 'queued', lastResult: msg, attemptCount: (data.attemptCount || 0) + 1, errorAt: nowTs() });
-          // Hindari spin cepat
-          await sleep(200);
+        const attempts = (data.attemptCount || 0) + 1;
+        if (attempts < MAX_ATTEMPTS && isRetryableError(err)) {
+          await doc.ref.update({ status: 'queued', lastResult: msg, attemptCount: attempts, errorAt: nowTs() });
+          await sleep(200); // Hindari loop cepat
         } else {
-          await doc.ref.update({ status: 'error', errorAt: nowTs(), lastResult: msg });
+          await doc.ref.update({ status: 'error', errorAt: nowTs(), lastResult: msg, attemptCount: attempts });
+          // Dead-letter copy untuk investigasi
+          await db.collection('failed_notifications').add({
+            refId: doc.id,
+            payload: { title, body, topic, token, imageUrl, action, additionalData, debug, expiry },
+            error: msg,
+            attempts,
+            failedAt: nowTs(),
+            from: 'github-actions',
+          });
         }
     }
       processed++;
