@@ -6,8 +6,12 @@ function initFirebase(): void {
   const json = process.env.GCP_SA_JSON;
   let options: AppOptions | undefined;
   if (json) {
-    const creds = JSON.parse(json);
-    options = { credential: cert(creds), projectId: process.env.FIREBASE_PROJECT_ID };
+    try {
+      const creds = JSON.parse(json);
+      options = { credential: cert(creds), projectId: process.env.FIREBASE_PROJECT_ID };
+    } catch (e) {
+      throw new Error('GCP_SA_JSON tidak valid: ' + (e as Error).message);
+    }
   } else {
     options = { credential: applicationDefault(), projectId: process.env.FIREBASE_PROJECT_ID };
   }
@@ -31,6 +35,7 @@ function sleep(ms: number): Promise<void> {
 function isRetryableError(e: unknown): boolean {
   const code = (e as any)?.code || (e as any)?.errorInfo?.code;
   const msg = String((e as any)?.message || e || '');
+  // Quota/429/resource exhausted/transient network
   return (
     code === 'resource-exhausted' ||
     code === 'quota-exceeded' ||
@@ -54,11 +59,15 @@ async function main(): Promise<void> {
   const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS ?? '5', 10);
 
   let processed = 0;
+  const MAX_REQUEUE_PER_DOC = 2; // hindari spin dalam satu run
   for (let batch = 0; batch < MAX_BATCHES; batch++) {
+    // Ambil dokumen yang due (status==queued && scheduleTime <= now)
     const dueSnap = await db
       .collection('scheduled_notifications')
       .where('status', '==', 'queued')
       .where('scheduleTime', '<=', nowTs())
+      // Hormati jeda retry: hanya ambil yang nextAttemptAt kosong atau sudah lewat
+      .where('nextAttemptAt', '<=', nowTs())
       .orderBy('scheduleTime', 'asc')
       .limit(BATCH_LIMIT)
       .get();
@@ -69,27 +78,28 @@ async function main(): Promise<void> {
     }
 
     for (const doc of dueSnap.docs) {
-      const data = doc.data() as any;
+    const data = doc.data() as any;
 
-      await db.runTransaction(async (tx: Transaction) => {
-        const ref = doc.ref;
-        const snap = await tx.get(ref);
-        if (!snap.exists) return;
-        const cur = snap.data() as DocumentData;
-        if (cur.status !== 'queued') return;
-        tx.update(ref, { status: 'processing', processingAt: nowTs() });
-      });
+    // Idempoten: gunakan transaksi untuk lock singkat
+    await db.runTransaction(async (tx: Transaction) => {
+      const ref = doc.ref;
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const cur = snap.data() as DocumentData;
+      if (cur.status !== 'queued') return; // sudah diproses oleh worker lain
 
-      const title = toSafeString(data.title) ?? 'Pemberitahuan';
-      const body = toSafeString(data.body) ?? '';
-      const topic = toSafeString(data.topic);
-      const token = toSafeString(data.token);
-      const imageUrl = toSafeString(data.imageUrl);
-      const action = toSafeString(data.action);
-      const additionalData =
-        data.additionalData && typeof data.additionalData === 'object' ? data.additionalData : undefined;
-      const debug = Boolean(data.debug);
-      const expiry = data.expiry ? Timestamp.fromDate(new Date(data.expiry)) : undefined;
+      tx.update(ref, { status: 'processing', processingAt: nowTs() });
+    });
+
+    const title = toSafeString(data.title) ?? 'Pemberitahuan';
+    const body = toSafeString(data.body) ?? '';
+    const topic = toSafeString(data.topic);
+    const token = toSafeString(data.token);
+    const imageUrl = toSafeString(data.imageUrl);
+    const action = toSafeString(data.action);
+    const additionalData = (data.additionalData && typeof data.additionalData === 'object') ? data.additionalData : undefined;
+    const debug = Boolean(data.debug);
+    const expiry = data.expiry ? Timestamp.fromDate(new Date(data.expiry)) : undefined;
 
       if (!topic && !token) {
         console.warn(`Lewati ${doc.id}: tidak ada target (topic/token).`);
@@ -97,27 +107,42 @@ async function main(): Promise<void> {
         continue;
       }
 
-      const message = {
-        topic,
-        token,
-        notification: { title, body, imageUrl },
-        data: {
-          title,
-          body,
-          imageUrl: imageUrl ?? '',
-          action: action ?? '',
-          debug: debug ? 'true' : 'false',
-          screen: '/notifications_screen',
-          ...(additionalData ?? {}),
+    const message = {
+      topic: topic,
+      token: token,
+      notification: {
+        title,
+        body,
+        imageUrl: imageUrl,
+      },
+      data: {
+        title,
+        body,
+        imageUrl: imageUrl ?? '',
+        action: action ?? '',
+        debug: debug ? 'true' : 'false',
+        screen: '/notifications_screen',
+        ...(additionalData ?? {}),
+      },
+      android: {
+        notification: {
+          channelId: 'high_importance_channel',
+          imageUrl: imageUrl,
+          priority: 'HIGH',
         },
-        android: { notification: { channelId: 'high_importance_channel', imageUrl, priority: 'HIGH' } },
-        apns: {
-          payload: { aps: { 'mutable-content': 1, 'content-available': 1 } },
-          fcmOptions: imageUrl ? { imageUrl } : undefined,
+      },
+      apns: {
+        payload: {
+          aps: {
+            'mutable-content': 1,
+            'content-available': 1,
+          },
         },
-      } as any;
+        fcmOptions: imageUrl ? { imageUrl } : undefined,
+      },
+    } as any;
 
-      try {
+  try {
         if (DRY_RUN) {
           console.log(`[DRY_RUN] Would send ${doc.id} to ${token ? 'token' : 'topic'}: ${token ?? topic}`);
           await doc.ref.update({ status: 'sent', sentAt: nowTs(), lastResult: 'dry-run' });
@@ -127,7 +152,8 @@ async function main(): Promise<void> {
           await doc.ref.update({ status: 'sent', sentAt: nowTs(), lastResult: 'ok' });
         }
 
-        await db.collection('notifications').add({
+        // Catat ke koleksi notifications sesuai pola app
+        const logDoc = {
           title,
           body,
           imageUrl: imageUrl ?? null,
@@ -136,16 +162,32 @@ async function main(): Promise<void> {
           timestamp: nowTs(),
           expiry: expiry ?? null,
           from: 'github-actions',
-        });
-      } catch (err) {
+        };
+        await db.collection('notifications').add(logDoc);
+    } catch (err) {
         const msg = (err as Error).message ?? String(err);
         console.error(`Gagal kirim ${doc.id}:`, msg);
         const attempts = (data.attemptCount || 0) + 1;
         if (attempts < MAX_ATTEMPTS && isRetryableError(err)) {
-          await doc.ref.update({ status: 'queued', lastResult: msg, attemptCount: attempts, errorAt: nowTs() });
-          await sleep(200);
+          // Exponential backoff: 1m, 2m, 4m, ... capped to 30m
+          const baseMs = 60_000;
+          const delayMs = Math.min(baseMs * Math.pow(2, Math.max(0, attempts - 1)), 30 * 60_000);
+          const next = Timestamp.fromDate(new Date(Date.now() + delayMs));
+          const requeueCount = (data._requeueInRun || 0) + 1;
+          await doc.ref.update({
+            status: 'queued',
+            lastResult: msg,
+            attemptCount: attempts,
+            errorAt: nowTs(),
+            nextAttemptAt: next,
+            _requeueInRun: requeueCount,
+          });
+          if (requeueCount <= MAX_REQUEUE_PER_DOC) {
+            await sleep(200); // Hindari loop cepat tapi tetap beri kesempatan di run yang sama
+          }
         } else {
           await doc.ref.update({ status: 'error', errorAt: nowTs(), lastResult: msg, attemptCount: attempts });
+          // Dead-letter copy untuk investigasi
           await db.collection('failed_notifications').add({
             refId: doc.id,
             payload: { title, body, topic, token, imageUrl, action, additionalData, debug, expiry },
@@ -155,11 +197,11 @@ async function main(): Promise<void> {
             from: 'github-actions',
           });
         }
-      }
+    }
       processed++;
     }
 
-    if (dueSnap.size < BATCH_LIMIT) break;
+    if (dueSnap.size < BATCH_LIMIT) break; // habis dalam batch ini
   }
   console.log(`Selesai. Diproses: ${processed} dokumen.`);
 }
