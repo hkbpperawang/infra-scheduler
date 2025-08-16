@@ -2,7 +2,7 @@ name: Scheduled Notifications
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # setiap 15 menit (UTC)
+    - cron: '*/5 * * * *' # setiap 5 menit (UTC)
   workflow_dispatch: {}
 
 concurrency:
