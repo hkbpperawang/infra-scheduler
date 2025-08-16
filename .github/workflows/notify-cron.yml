@@ -20,10 +20,18 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Preflight secrets
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+        run: |
+          [ -n "$GCP_SA_JSON" ] || (echo "Missing secret: GCP_SA_JSON" && exit 1)
+          [ -n "$FIREBASE_PROJECT_ID" ] || (echo "Missing secret: FIREBASE_PROJECT_ID" && exit 1)
+
       - name: Install dependencies
         working-directory: infra-scheduler
         run: |
-          npm ci
+          npm install --no-audit --no-fund
 
       - name: Build
         working-directory: infra-scheduler
